@@ -85,19 +85,11 @@ class PgupsWebFetcher {
   }
 
   void onWebResourceError(WebResourceError error) {
-    // Only meaningful for the top-level document; subresource errors (a
-    // missing image/font/blocked analytics or ad script, etc.) are
-    // extremely common on a perfectly normal page load and must NOT fail
-    // the whole fetch.
-    //
-    // Trust `isForMainFrame` when the platform actually reports it (either
-    // true or false). Only fall back to URL-matching when that flag is
-    // unavailable — and even then, if we can't determine a URL either,
-    // treat it as a subresource rather than guessing "main frame": a
-    // wrong "true" guess here breaks every normal load that happens to
-    // have one blocked tracker, whereas a wrong "false" guess just means
-    // we fall through to _extractHtml(), which is exactly the safe,
-    // pre-existing fallback behavior for an unclassifiable error anyway.
+    // Best-effort diagnostic info only (used for the exception's message
+    // if we do end up throwing one, based on the content check in get()
+    // below) — not itself the trigger for treating the fetch as failed.
+    // See the comment in get() for why: `isForMainFrame` isn't reliably
+    // meaningful for every kind of request across WebView versions.
     final isForMainFrame = error.isForMainFrame;
     final bool isMainFrame;
     if (isForMainFrame != null) {
@@ -111,6 +103,30 @@ class PgupsWebFetcher {
     }
   }
 
+  /// Detects a browser-generated "the page didn't load" interstitial,
+  /// as opposed to real site content. Two different templates have shown
+  /// up in the wild, depending on the WebView engine/version:
+  ///  - Chrome's own neterror interstitial, which always contains a
+  ///    container with this id, regardless of the specific net::ERR_*
+  ///    reason or the device's locale.
+  ///  - Android System WebView's older, separate built-in error page,
+  ///    which instead uses a fixed, English, locale-independent
+  ///    "Webpage not available" title (seen directly in the wild on a
+  ///    real device — the screenshot that prompted this check). A page
+  ///    titled exactly that is not something the real site would ever
+  ///    render, so matching the title is safe.
+  bool _looksLikeNetworkErrorPage(String html) {
+    if (html.contains('id="main-frame-error"') ||
+        html.contains("id='main-frame-error'")) {
+      return true;
+    }
+    final titleMatch =
+        RegExp(r'<title>\s*([^<]*)\s*</title>', caseSensitive: false)
+            .firstMatch(html);
+    final title = titleMatch?.group(1)?.trim().toLowerCase();
+    return title == 'webpage not available';
+  }
+
   /// Loads [url] in the shared WebView, waits for the page (and any
   /// JS-driven anti-bot reload) to settle, then returns the resulting HTML.
   Future<PgupsResponse> get(String url) async {
@@ -120,9 +136,10 @@ class PgupsWebFetcher {
           'WebView ещё не готов — попробуйте ещё раз через мгновение.');
     }
 
+    _targetUri = Uri.parse(url);
+
     _lastMainFrameStatus = null;
     _lastMainFrameError = null;
-    _targetUri = Uri.parse(url);
 
     await controller.loadRequest(_targetUri!);
     await _waitForSettledLoad();
@@ -134,17 +151,39 @@ class PgupsWebFetcher {
     // GroupsService/ScheduleService as if it were real site content
     // (this is exactly what produced the garbled "Не удалось загрузить
     // список групп... <html><head>..." error users would otherwise see).
-    // Catch that here and fail loudly with a real network error instead.
-    final resourceError = _lastMainFrameError;
-    if (resourceError != null) {
+    //
+    // We deliberately do NOT decide this from onWebResourceError firing:
+    // that callback also fires for things that never affect the real page
+    // — a blocked tracker, a missing favicon, or (as seen in the wild,
+    // release-build-only) the site's own JS doing a cache-probe fetch()
+    // to the exact same URL that intentionally raises net::ERR_CACHE_MISS
+    // and handles it itself. Whether isForMainFrame is trustworthy for
+    // that kind of request varies by WebView engine version/device, so
+    // gating on it caused false positives even after real page loads.
+    // Instead we check what actually got rendered: a browser-generated
+    // "page didn't load" interstitial, detected via
+    // _looksLikeNetworkErrorPage (see its doc comment for the two
+    // templates this covers).
+    //
+    // NOTE: this method deliberately does NOT retry internally. A single
+    // bad round trip (false-positive race, transient net::ERR_TIMED_OUT,
+    // ...) is instead absorbed by the retry loop that already lives one
+    // layer up, in GroupsService/ScheduleService's `_fetchFromNetwork`
+    // (3 attempts with backoff, falling back to cache on final failure).
+    // Retrying at both layers previously multiplied into up to 3×3 = 9
+    // full WebView loads (each with its own ~20s timeout) before ever
+    // reaching the cache fallback — which looked like the app hanging /
+    // "everything breaking" rather than the intended fast cache-first,
+    // network-in-background behavior.
+    final html = await _extractHtml(controller);
+    if (_looksLikeNetworkErrorPage(html)) {
+      final err = _lastMainFrameError;
       throw PgupsNetworkException(
         url,
-        resourceError.description,
-        resourceError.errorCode,
+        err?.description ?? 'страница не открылась',
+        err?.errorCode,
       );
     }
-
-    final html = await _extractHtml(controller);
 
     return PgupsResponse(
       statusCode: _lastMainFrameStatus ?? 200,
@@ -200,4 +239,3 @@ class PgupsWebFetcher {
     return s;
   }
 }
-  
